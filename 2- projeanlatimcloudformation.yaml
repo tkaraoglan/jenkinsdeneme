@@ -1,0 +1,360 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: |
+    This Cloudformation Template deploys Phonebook Application to five Docker Machines on EC2 Instances which are ready for Docker Swarm operations. Docker Machines will run on Amazon Linux 2 with custom security group allowing SSH (22), HTTP (80) UDP (4789, 7946), and TCP(2377, 7946, 8080) connections from anywhere. User needs to select appropriate key name when launching the template.
+Parameters:
+# burası cloudformationa dosya yüklerken kullanıcının key.pem seçmesini istediğimiz bölüm.
+  KeyName:
+    Description: Enter Name of your key pair for ssh connections
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be one of the existing key pairs
+Resources:
+#ec2'lara bağlanma yöntemleri olarak ssh ve ec2 connect cli kullanılır. ec2 içerisinde güvenlik sebeplerinden dolayısıyla
+# private keylerimizi yüklemeyeceğimiz için private key paylaşmadan bunları birbirleriyle iletişim haline getirecek bir yönteme
+#ihtiyaç duyuyoruz. hatırlamak gerekirse biz private key ile kendi hesabımızdan bir ec2 oluşturduğumuz sırada ilgili ec2 içerisine
+# kendi private key pemimiz ile eşlecek bir 'public' key yerleştirir.
+# bizde kendimiz "ssh-keygen -t rsa" komutu vererek private ve public key oluşturabiliriz. bu komuttan sonra home/kullanıcı klasörü
+# altında /.ssh isimli bir klasörün altına keylerimizi üretir. bu oluşturduğumuz keylerden public olanı bir instancea yüklersek ve 
+# ilgili private key ile bağlanmaya çalışırsak başarılı şekilde bağlanabiliriz.
+# peki bu bilgi bizim ne işimize yarayacak?
+# public keyimizin olduğu instancelar birbirleri ile iletişime role atamak vasıtasıyla geçebilirler.
+# detaylı bir blog anlatımı için: https://aws.amazon.com/tr/blogs/infrastructure-and-automation/securing-your-bastion-hosts-with-amazon-ec2-instance-connect/
+# bu bilginin esas kaynağı ise burası : https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-connect-set-up.html#ec2-instance-connect-configure-IAM-role
+  InstanceConnectPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      PolicyDocument: #required
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2-instance-connect:SendSSHPublicKey
+            Resource:
+              - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+              # son proje çözümünde @Serdar - Instructor hoca nasıl ${AWS::Region}, ${AWS::AccountId}leri nasıl enviroment variable 
+              # olarak almayı başarıyor diye araştırırken bu sayfaya denk geldim arkadaşlar. işinize yarar umarım. 
+              # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/pseudo-parameter-reference.html
+              # ayrıca biz iam role'a atama yaparken eğer hesabımızda tanımlı bir policy var ise;
+              # arn numarası ile atama yapabiliyoruz. ilgili sayfaya giderek arn numara almaya bakabiliriz.
+            Condition: {"StringEquals": {"aws:ResourceTag/project": "202"}}
+            # burada tag kullanarak bu policynin sadece ilgili tag belirtilmiş ec2 instancelarda çalışmasını istediğimizi 
+            # belirtmiş oluyoruz.
+          - Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+            Resource: "*"
+  EC2InstanceConnect:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument: 
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - ec2.amazonaws.com 
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Ref InstanceConnectPolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess
+  EC2ConnectProfile:
+    # burası da ec2'ya ilgili iam rolü atamak için yazdığımız yer. 
+    # herhangi bir ec2 oluştururken bu profili ilgili instance'a eklememiz yeterli olacaktır.
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Roles: #required
+        - !Ref EC2InstanceConnect
+  DockerSwarmSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: Enable Connections for Swarm 
+      SecurityGroupIngress:
+        - IpProtocol: tcp  # http yayını için
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp # ssh ile bağlanmak için
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp # swarm: https://docs.docker.com/engine/swarm/swarm-tutorial/#open-protocols-and-ports-between-the-hosts
+          FromPort: 2377   
+          ToPort: 2377
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp  # swarm
+          FromPort: 7946
+          ToPort: 7946
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 7946 # swarm
+          ToPort: 7946
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 4789 # swarm
+          ToPort: 4789
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp   # viz ile ilgili.
+          FromPort: 8080 
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+
+  ManagersLT:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData: 
+        IamInstanceProfile:
+          Arn: !GetAtt EC2ConnectProfile.Arn
+        # eğer bir iam instance profili yani ilgili iam rolü instance'a bağlama işlemini Launch templatede yapacaksak
+        # arn ile yapıyoruz. instance için ise !ref ile yapıyoruz. burada launch template olduğu için arn ile yapıyoruz. instancelar 
+        # bu projede template üzerinden oluşacağı için  !ref atamasını iki manager ve iki worker için kullanmayacağız.
+        ImageId: ami-0947d2ba12ee1ff75
+        InstanceType: t2.micro
+        KeyName: !Ref KeyName
+        SecurityGroupIds: 
+          - !GetAtt DockerSwarmSecurityGroup.GroupId
+        UserData: 
+          Fn::Base64:
+            !Sub |
+              #! /bin/bash
+              yum update -y
+              # docker yükleme/ başlatma ve devamlı şekilde aktif hale getirme
+              amazon-linux-extras install docker -y
+              systemctl start docker
+              systemctl enable docker
+              # docker grubuna ec2-user kullanıcısını tanımlayarak docker işlemleri için yetkili kılıyoruz.
+              usermod -a -G docker ec2-user
+              #docker compose yükleme ilgili sayfa :https://docs.docker.com/compose/compose-file/#update_config
+              curl -L "https://github.com/docker/compose/releases/download/1.26.2/docker-compose-$(uname -s)-$(uname -m)" \
+              -o /usr/local/bin/docker-compose
+              # docker compose executable yani işlem yapabilir hale getiriyoruz.
+              chmod +x /usr/local/bin/docker-compose
+              yum install python3 -y
+              # mssh ile bağlanabilmek için gerekli olan python ve python modülünü yüklüyoruz.
+              #ilgili sayfa : http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-connect-set-up.html
+              pip3 install ec2instanceconnectcli
+              # UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no bu iki komutla ec2'ya bağlanırken
+              # bize yes mi no mu diye sormasını engelliyor ve bizi bir uygunsuz giriş olarak algılamasının önüne geçiyoruz.
+              # detaylı bilgi için şu sayfaya bakılabilir: https://www.shellhacks.com/disable-ssh-host-key-checking/
+              # linux konutlarında ec2 instance'a bağlanma gibi ilk komut sonrası başka bir komut girdiğimizde ilk komutu uygular,
+              #sonra ikinci komutun sonucunu bize gösterir. yani ec2 instance bağlanır, ilgili komutu uygular ve bize sonucu gösterir.
+              # ec2'ya bağlı kalmaz.
+              eval "$(mssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no  \
+                --region ${AWS::Region} ${DockerManager1} docker swarm join-token manager | grep -i 'docker')"
+              # ecr-helper'a bağlanmak için awscli2 indirip kuruyoruz.
+              # ilgili sayfa : https://aws.amazon.com/blogs/compute/authenticating-amazon-ecr-repositories-for-docker-cli-with-credential-helper/
+              curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+              unzip awscliv2.zip
+              ./aws/install
+              yum install amazon-ecr-credential-helper -y
+              # ecr helper işlemleri için gerekli işlemler
+              # detaylı bilgi için : https://github.com/awslabs/amazon-ecr-credential-helper 
+              mkdir -p /home/ec2-user/.docker
+              cd /home/ec2-user/.docker
+              echo '{"credsStore": "ecr-login"}' > config.json
+  WorkersLT:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData: 
+        IamInstanceProfile:
+          Arn: !GetAtt EC2ConnectProfile.Arn
+        ImageId: ami-0947d2ba12ee1ff75
+        InstanceType: t2.micro
+        KeyName: !Ref KeyName
+        SecurityGroupIds: 
+          - !GetAtt DockerSwarmSecurityGroup.GroupId
+        UserData: 
+          Fn::Base64:
+            !Sub |
+              #! /bin/bash
+              yum update -y
+              amazon-linux-extras install docker -y
+              systemctl start docker
+              systemctl enable docker
+              usermod -a -G docker ec2-user
+              curl -L "https://github.com/docker/compose/releases/download/1.26.2/docker-compose-$(uname -s)-$(uname -m)" \
+              -o /usr/local/bin/docker-compose
+              chmod +x /usr/local/bin/docker-compose
+              yum install python3 -y
+              pip3 install ec2instanceconnectcli
+              eval "$(mssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no  \
+                --region ${AWS::Region} ${DockerManager1} docker swarm join-token worker | grep -i 'docker')"
+              curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+              unzip awscliv2.zip
+              ./aws/install
+              yum install amazon-ecr-credential-helper -y
+              mkdir -p /home/ec2-user/.docker
+              cd /home/ec2-user/.docker
+              echo '{"credsStore": "ecr-login"}' > config.json
+  DockerManager1:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      IamInstanceProfile: !Ref EC2ConnectProfile
+      # burada arn ile değil !ref ile ec2'ya ilgili iam role profilini atıyoruz.
+      ImageId: ami-0947d2ba12ee1ff75
+      InstanceType: t2.micro
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !GetAtt DockerSwarmSecurityGroup.GroupId
+      Tags: #bu tag atama işlemini oluşacak bütün makinelerde gerçekleştiriyoruz. çünkü iam role belirlediğimiz şart
+      # tagda belirtilen key ve valuelara sahip ec2 instancelar için geçerli sadece.
+        - Key: Name 
+          Value: !Sub Docker Grand Master of ${AWS::StackName}
+        - Key: project
+          Value: "202"
+      UserData:
+        Fn::Base64:
+          !Sub
+            - |
+              #! /bin/bash
+              yum update -y
+              hostnamectl set-extras Grand-Master
+              amazon-linux-extras install docker -y
+              systemctl start docker
+              systemctl enable docker
+              usermod -a -G docker ec2-user
+              curl -L "https://github.com/docker/compose/releases/download/1.26.2/docker-compose-$(uname -s)-$(uname -m)" \
+              -o /usr/local/bin/docker-compose
+              chmod +x /usr/local/bin/docker-compose
+              # docker swarm işlemini başlatıyoruz.
+              docker swarm init
+              # aşağıdaki komut ile de ecr'a giriş yapıyoruz. nasıl giriş yapacağımızı ve bu komutu da şu sayfadan alıyoruz:
+              # https://docs.aws.amazon.com/AmazonECR/latest/userguide/Registries.html
+              aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+              # docker bize bir görselleştirme imkanı da veriyor. ayrıca bizden viz uygulamasının da çalıştırılması istendiği için
+              # bu servisi de yüklüyoruz. ilgili sayfa : https://github.com/dockersamples/docker-swarm-visualizer
+              docker service create \
+                --name=viz \
+                --publish=8080:8080/tcp \
+                --constraint=node.role==manager \
+                --mount=type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
+                dockersamples/visualizer
+              # git yüklüyoruz çünkü githubdan birtakım dosyalar alacağız.
+              yum install git -y
+              curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+              unzip awscliv2.zip
+              ./aws/install
+              yum install amazon-ecr-credential-helper -y 
+              mkdir -p /home/ec2-user/.docker
+              cd /home/ec2-user/.docker
+              echo '{"credsStore": "ecr-login"} > config.json'
+              # aws ecr repo oluşturma komutumuz: https://awscli.amazonaws.com/v2/documentation/api/latest/reference/ecr/create-repository.html
+              # daha detaylı ve güzel bir döküman : https://docs.aws.amazon.com/AmazonECR/latest/userguide/getting-started-cli.html
+              aws ecr create-repository \
+                  --repository-name ${APP_REPO_NAME} \
+                  --image-scanning-configuration scanOnPush=false \ # 2019'da gelen bu özellik ile genel güvenlik taraması aktif hale getirilebilir.
+                  --image-tag-mutability MUTABLE \ #image tag yani isimlerinin aynı ismin verilmesinin önüne geçmeye yarayan özellik.
+                  --region ${AWS::Region}
+              # burada docker image oluşturuyoruz. ilgili değişkenler ile bunu sağlıyoruz 
+              docker build --force-rm -t "${ECR_REGISTRY}/${APP_REPO_NAME}:latest" ${GITHUB_REPO}
+              # ecr'a push ediyoruz.
+              docker push "${ECR_REGISTRY}/${APP_REPO_NAME}:latest"
+              # burada phonebook isimli bir dosya oluşturuyoruz. "-p" flag kullanımı verdiğimiz path'de eğer ilgili dosya yoksa onları da 
+              # oluşturuyor.
+              mkdir -p /home/ec2-user/phonebook
+              cd /home/ec2-user/phonebook
+              # aşağıdaki komut ile hatırlarsak docker compose env. var. için .env dosyasın abkıyor demiştik. bu komut ile bu 
+              # dosyayı oluşturuyoruz ve dosyanın sonuna gelecek şekilde bu değişkenleri işliyoruz.
+              cat << EOF | tee .env
+              ECR_REGISTRY=${ECR_REGISTRY}
+              APP_REPO_NAME=${APP_REPO_NAME}
+              EOF
+              # docker compose ve init.sql dosyalarımızı githubdan phonebook klasörüne cekiyoruz.
+              curl -o "docker-compose.yml" -L ${GIT_FILE_URL}docker-compose.yml
+              curl -o "init.sql" -L ${GIT_FILE_URL}init.sql
+              # config komutu ayrıca docker compose file'ı validate/geçerli hale getiriyor.
+              # --with-registry-auth	ise	Swarm modu için  swarma bağlı nodelardaki agentlara yetkilendirme bilgilerini gönderiyor.
+              # yani biz diyoruz ki benim docker compose dosyam şuradadır ve bilgileri buradan al.
+              docker-compose config | docker stack deploy --with-registry-auth -c - phonebook
+              # burada değişken tanımlamalarımızı yapıyoruz. her seferinde uzun uzun uğraşmayalım diye.
+            - ECR_REGISTRY: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+            # şunu tekrar hatırlamakta fayda var. kendi hesabımız içiresindeki account id, region gibi bilgileri direkt olarak çekebiliyoruz.
+            # yukarıda bahsedilmişti, ilgili sayfayı buraya yazalım, https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/pseudo-parameter-reference.html
+              APP_REPO_NAME: clarusway-repo/phonebook-app
+              #repo name istediğimiz ismi verebiliriz. projede bizden böyle istendiği için bu ismi yazıyoruz.
+              GITHUB_REPO: https://github.com/serdarcw/202-jenkins-pipeline-for-phonebook-app-on-docker-swarm.git
+              #ilgili github repomuzun localimize clone işlemi yaparken aldığımız adresi buraya koyuyoruz.
+              GIT_FILE_URL: https://raw.githubusercontent.com/serdarcw/202-jenkins-pipeline-for-phonebook-app-on-docker-swarm/master/
+              # bu da dosyamızın adresi. (raw butonuna bastıktan sonra master veya main kısmına kadar alınmış halini koyuyoruz.)
+  DockerManager2:
+    Type: "AWS::EC2::Instance"
+    DependsOn:
+      - DockerManager1
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ManagersLT
+        Version: !GetAtt ManagersLT.LatestVersionNumber
+      Tags:
+        - Key: Name 
+          Value: !Sub Docker Manager 2 of ${AWS::StackName}
+        - Key: project
+          Value: "202"
+  DockerManager3:
+    Type: "AWS::EC2::Instance"
+    DependsOn:
+      - DockerManager1
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ManagersLT
+        Version: !GetAtt ManagersLT.LatestVersionNumber
+      Tags:
+        - Key: Name 
+          Value: !Sub Docker Manager 3 of ${AWS::StackName}
+        - Key: project
+          Value: "202"
+  DockerWorker1:
+    Type: "AWS::EC2::Instance"
+    DependsOn:
+      - DockerManager2
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkersLT
+        Version: !GetAtt WorkersLT.LatestVersionNumber
+      Tags:
+        - Key: Name 
+          Value: !Sub Docker Worker 1 of ${AWS::StackName}
+        - Key: project
+          Value: "202"
+  DockerWorker2:
+    Type: "AWS::EC2::Instance"
+    DependsOn:
+      - DockerManager2
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkersLT
+        Version: !GetAtt WorkersLT.LatestVersionNumber
+      Tags:
+        - Key: Name 
+          Value: !Sub Docker Worker 2 of ${AWS::StackName}
+        - Key: project
+          Value: "202"
+
+Outputs:
+  VizDashboard: 
+    Description: Dashboard URL
+    Value: !Sub 
+      - http://${PublicAddress}:8080 # viz için
+      - PublicAddress: !GetAtt DockerManager1.PublicDnsName
+  1stManagerDNSName:
+    Description: 1st Docker Manager DNS Name
+    Value: !Sub 
+      - ${PublicAddress}
+      - PublicAddress: !GetAtt DockerManager1.PublicDnsName
+  2ndManagerDNSName:
+    Description: 2nd Docker Manager DNS Name
+    Value: !Sub 
+      - ${PublicAddress}
+      - PublicAddress: !GetAtt DockerManager2.PublicDnsName
+  3rdManagerDNSName:
+    Description: 3rd Docker Manager DNS Name
+    Value: !Sub 
+      - ${PublicAddress}
+      - PublicAddress: !GetAtt DockerManager3.PublicDnsName
+  1stWorkerDNSName:
+    Description: 1st Docker Worker DNS Name
+    Value: !Sub 
+      - ${PublicAddress}
+      - PublicAddress: !GetAtt DockerWorker1.PublicDnsName
+  2ndWorkerDNSName:
+    Description: 2nd Docker Worker DNS Name
+    Value: !Sub 
+      - ${PublicAddress}
+      - PublicAddress: !GetAtt DockerWorker2.PublicDnsName

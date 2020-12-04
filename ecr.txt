@@ -1,0 +1,3 @@
+https://aws.amazon.com/blogs/compute/authenticating-amazon-ecr-repositories-for-docker-cli-with-credential-helper/
+
+https://github.com/awslabs/amazon-ecr-credential-helper

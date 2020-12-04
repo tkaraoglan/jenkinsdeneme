@@ -1,0 +1,1 @@
+hocam bunu kurup ctrl+shift+I ile otomatik formatını düzenleyebilirsiniz groovy lint format and fix nicalo vulluamy
